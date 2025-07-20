@@ -90,65 +90,182 @@ func compressFolder(src, dest string) error {
 	return filepath.Walk(src, walkFn)
 }
 
+func splitFile(inputPath, outputDir, baseName string, splitSize int64) ([]string, error) {
+	log.Printf("[SPLIT] Splitting %s into chunks of %d bytes", inputPath, splitSize)
+	
+	input, err := os.Open(inputPath)
+	if err != nil {
+		return nil, fmt.Errorf("failed to open input file: %w", err)
+	}
+	defer input.Close()
+	
+	var chunkFiles []string
+	chunkNum := 1
+	
+	for {
+		chunkPath := filepath.Join(outputDir, fmt.Sprintf("%s.part%03d", baseName, chunkNum))
+		output, err := os.Create(chunkPath)
+		if err != nil {
+			return nil, fmt.Errorf("failed to create chunk file %s: %w", chunkPath, err)
+		}
+		
+		// Use io.CopyN to copy exactly splitSize bytes (or remaining bytes)
+		bytesWritten, err := io.CopyN(output, input, splitSize)
+		output.Close()
+		
+		if err != nil && err != io.EOF {
+			os.Remove(chunkPath)
+			return nil, fmt.Errorf("failed to read input file: %w", err)
+		}
+		
+		// Only add the chunk if it has content
+		if bytesWritten > 0 {
+			chunkFiles = append(chunkFiles, chunkPath)
+			log.Printf("[SPLIT] Created chunk %d: %s (%d bytes)", chunkNum, chunkPath, bytesWritten)
+		} else {
+			// Remove empty chunk file
+			os.Remove(chunkPath)
+			log.Printf("[SPLIT] Skipped empty chunk %d", chunkNum)
+		}
+		
+		// If we read less than splitSize, we've reached the end of the file
+		if bytesWritten < splitSize {
+			break
+		}
+		chunkNum++
+	}
+	
+	log.Printf("[SPLIT] Split complete: %d chunks created", len(chunkFiles))
+	return chunkFiles, nil
+}
+
 func uploadToDrive(srv *drive.Service, filePath, fileName, parentID string) (string, error) {
 	log.Printf("[UPLOAD] Starting upload for %s", fileName)
 	
-	f, err := os.Open(filePath)
-	if err != nil {
-		return "", fmt.Errorf("failed to open file: %w", err)
-	}
-	defer f.Close()
-
-	file := &drive.File{Name: fileName}
-	if parentID != "" {
-		file.Parents = []string{parentID}
-	} else {
-		file.Parents = []string{"root"}
-	}
-	
-	// Create the upload call
-	createCall := srv.Files.Create(file).
-		SupportsAllDrives(true).
-		Fields("id")
-
-	// Check if custom chunk size is specified
-	var chunkSize int64 = 0
-	if chunkSizeStr := os.Getenv("UPLOAD_CHUNK_SIZE"); chunkSizeStr != "" {
+	// Check if we should split the file
+	var splitSize int64 = 0
+	splitSizeStr := os.Getenv("UPLOAD_SPLIT_SIZE")
+	if splitSizeStr != "" {
 		var err error
-		chunkSize, err = parseSizeString(chunkSizeStr)
+		splitSize, err = parseSizeString(splitSizeStr)
 		if err != nil {
-			log.Printf("[WARN] Invalid UPLOAD_CHUNK_SIZE value: %s (%v), using default", chunkSizeStr, err)
+			log.Printf("[WARN] Invalid UPLOAD_SPLIT_SIZE value: %s (%v), splitting disabled", splitSizeStr, err)
+			splitSize = 0
 		} else {
-			log.Printf("[UPLOAD] Setting chunk size to %d bytes (%s)", chunkSize, chunkSizeStr)
+			log.Printf("[UPLOAD] Split size set to %d bytes (%s)", splitSize, splitSizeStr)
 		}
 	}
 	
-	// Use custom chunk size if specified, otherwise use default
-	if chunkSize > 0 {
-		log.Printf("[UPLOAD] Using custom chunk size of %d bytes", chunkSize)
-		createCall = createCall.Media(f, googleapi.ChunkSize(int(chunkSize)))
-	} else {
-		log.Printf("[UPLOAD] Using default chunk size")
-		createCall = createCall.Media(f)
-	}
-	
-	created, err := createCall.Do()
+	// Get file info to check if splitting is needed
+	fileInfo, err := os.Stat(filePath)
 	if err != nil {
-		return "", fmt.Errorf("failed to upload: %w", err)
+		return "", fmt.Errorf("failed to get file info: %w", err)
 	}
 	
-	log.Printf("[UPLOAD] Finished upload for %s. File ID: %s", fileName, created.Id)
-	return created.Id, nil
+	var filesToUpload []string
+	var fileNames []string
+	
+	if splitSize > 0 && fileInfo.Size() > splitSize {
+		// Split the file
+		baseName := strings.TrimSuffix(fileName, filepath.Ext(fileName))
+		chunkFiles, err := splitFile(filePath, tmpDir, baseName, splitSize)
+		if err != nil {
+			return "", fmt.Errorf("failed to split file: %w", err)
+		}
+		filesToUpload = chunkFiles
+		for _, chunkPath := range chunkFiles {
+			fileNames = append(fileNames, filepath.Base(chunkPath))
+		}
+	} else {
+		// Upload the original file
+		filesToUpload = []string{filePath}
+		fileNames = []string{fileName}
+	}
+	
+	// Upload each file/chunk
+	var uploadedFileIDs []string
+	for i, uploadPath := range filesToUpload {
+		uploadName := fileNames[i]
+		log.Printf("[UPLOAD] Uploading %s (%d/%d)", uploadName, i+1, len(filesToUpload))
+		
+		f, err := os.Open(uploadPath)
+		if err != nil {
+			return "", fmt.Errorf("failed to open file %s: %w", uploadPath, err)
+		}
+		
+		file := &drive.File{Name: uploadName}
+		if parentID != "" {
+			file.Parents = []string{parentID}
+		} else {
+			file.Parents = []string{"root"}
+		}
+		
+		// Create the upload call
+		createCall := srv.Files.Create(file).
+			SupportsAllDrives(true).
+			Fields("id")
+
+		// Check if custom chunk size is specified
+		var chunkSize int64 = 0
+		if chunkSizeStr := os.Getenv("UPLOAD_CHUNK_SIZE"); chunkSizeStr != "" {
+			var err error
+			chunkSize, err = parseSizeString(chunkSizeStr)
+			if err != nil {
+				log.Printf("[WARN] Invalid UPLOAD_CHUNK_SIZE value: %s (%v), using default", chunkSizeStr, err)
+			} else {
+				log.Printf("[UPLOAD] Setting chunk size to %d bytes (%s)", chunkSize, chunkSizeStr)
+			}
+		}
+		
+		// Use custom chunk size if specified, otherwise use default
+		if chunkSize > 0 {
+			log.Printf("[UPLOAD] Using custom chunk size of %d bytes", chunkSize)
+			createCall = createCall.Media(f, googleapi.ChunkSize(int(chunkSize)))
+		} else {
+			log.Printf("[UPLOAD] Using default chunk size")
+			createCall = createCall.Media(f)
+		}
+		
+		created, err := createCall.Do()
+		f.Close() // Close file after upload
+		
+		if err != nil {
+			// Log the full error for debugging
+			log.Printf("[ERROR] Upload failed with error: %v", err)
+			return "", fmt.Errorf("failed to upload %s: %w", uploadName, err)
+		}
+		
+		uploadedFileIDs = append(uploadedFileIDs, created.Id)
+		log.Printf("[UPLOAD] Finished upload for %s. File ID: %s", uploadName, created.Id)
+		
+		// Clean up chunk file if it was created by splitting
+		if len(filesToUpload) > 1 {
+			if err := os.Remove(uploadPath); err != nil {
+				log.Printf("[WARN] Failed to remove chunk file %s: %v", uploadPath, err)
+			} else {
+				log.Printf("[CLEANUP] Removed chunk file %s", uploadPath)
+			}
+		}
+	}
+	
+	if len(uploadedFileIDs) == 1 {
+		return uploadedFileIDs[0], nil
+	}
+	
+	// If we uploaded multiple chunks, return the first file ID and log all IDs
+	log.Printf("[UPLOAD] Uploaded %d chunks. File IDs: %v", len(uploadedFileIDs), uploadedFileIDs)
+	return uploadedFileIDs[0], nil
 }
 
 func cleanupOldBackups(srv *drive.Service, parentID string, retentionDays int) error {
 	debug := newDebugLogger()
 	cutoff := time.Now().AddDate(0, 0, -retentionDays)
 	log.Printf("[RETENTION] Checking for backups older than %d days (cutoff: %s)", retentionDays, cutoff.Format(time.RFC3339))
-	
-	q := "name contains '.tar.gz' and trashed = false"
+
+	// Query for both .tar.gz and .part files
+	q := "(name contains '.tar.gz' or name contains '.part') and trashed = false"
 	debug.Printf("Retention query: %s", q)
-	
+
 	filesList := srv.Files.List().Q(q).SupportsAllDrives(true).Fields("files(id, name, createdTime, parents)")
 	if parentID != "" && parentID != "root" {
 		filesList = filesList.DriveId(parentID).Corpora("drive").IncludeItemsFromAllDrives(true)
@@ -158,18 +275,49 @@ func cleanupOldBackups(srv *drive.Service, parentID string, retentionDays int) e
 		return fmt.Errorf("listing files: %w", err)
 	}
 	debug.Printf("Found %d files for retention check", len(files.Files))
-	
+
+	// Group files by backup prefix
+	type fileInfo struct {
+		id   string
+		name string
+		created string
+	}
+	backupGroups := make(map[string][]fileInfo)
 	for _, f := range files.Files {
-		debug.Printf("Checking file: %s (created %s) parents: %v", f.Name, f.CreatedTime, f.Parents)
-		created, err := time.Parse(time.RFC3339, f.CreatedTime)
+		// Extract prefix: everything up to .tar.gz or .tar.partXXX
+		prefix := f.Name
+		if idx := strings.Index(prefix, ".tar.gz"); idx != -1 {
+			prefix = prefix[:idx]
+		} else if idx := strings.Index(prefix, ".tar.part"); idx != -1 {
+			prefix = prefix[:idx]
+		}
+		backupGroups[prefix] = append(backupGroups[prefix], fileInfo{f.Id, f.Name, f.CreatedTime})
+	}
+
+	// For each group, use the earliest createdTime as the backup time
+	for prefix, group := range backupGroups {
+		if len(group) == 0 {
+			continue
+		}
+		// Find the earliest createdTime
+		earliest := group[0]
+		for _, fi := range group {
+			if fi.created < earliest.created {
+				earliest = fi
+			}
+		}
+		created, err := time.Parse(time.RFC3339, earliest.created)
 		if err != nil {
-			log.Printf("[RETENTION] Could not parse time for file %s: %v", f.Name, err)
+			log.Printf("[RETENTION] Could not parse time for backup %s: %v", prefix, err)
 			continue
 		}
 		if retentionDays == 0 || created.Before(cutoff) {
-			log.Printf("[RETENTION] Deleting old backup: %s (created %s)", f.Name, f.CreatedTime)
-			if err := srv.Files.Delete(f.Id).SupportsAllDrives(true).Do(); err != nil {
-				log.Printf("[RETENTION] Error deleting %s: %v", f.Name, err)
+			log.Printf("[RETENTION] Deleting old backup group: %s (created %s)", prefix, earliest.created)
+			for _, fi := range group {
+				log.Printf("[RETENTION] Deleting file: %s", fi.name)
+				if err := srv.Files.Delete(fi.id).SupportsAllDrives(true).Do(); err != nil {
+					log.Printf("[RETENTION] Error deleting %s: %v", fi.name, err)
+				}
 			}
 		}
 	}

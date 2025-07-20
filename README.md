@@ -28,6 +28,7 @@ A Docker container that compresses folders from `/backup/` and uploads them to G
 | `TZ` | Timezone for timestamps (e.g., `America/New_York`) | (system default) |
 | `FILENAME_SAFE_TIMESTAMP` | Set to `true` to replace colons with dashes in timestamps | `false` |
 | `UPLOAD_CHUNK_SIZE` | Chunk size for resumable uploads (e.g., `1GB`, `8MB`, `16MB`) | (Google API default) |
+| `UPLOAD_SPLIT_SIZE` | Split large files into chunks before uploading (e.g., `100MB`, `1GB`). If not set, no splitting occurs. | (disabled) |
 | `DEBUG` | Set to any value to enable debug logging | (disabled) |
 
 ## Timestamp Format
@@ -43,7 +44,9 @@ The filename-safe format replaces colons with dashes to ensure compatibility wit
 ### Upload Behavior
 The script uses Google Drive's Media API which automatically handles resumable uploads for all files. The chunk size configuration allows you to customize how the upload is performed.
 
-### Chunk Size Configuration
+### Upload Configuration
+
+#### Chunk Size Configuration
 - **Default behavior**: Uses Google Drive API's default chunk size (16MB)
 - **Custom chunk size**: Set `UPLOAD_CHUNK_SIZE` to override the default
 - Supports human-readable formats: `8MB`, `16MB`, `1GB`, `2GB`, etc.
@@ -51,6 +54,21 @@ The script uses Google Drive's Media API which automatically handles resumable u
 - Common chunk sizes: `8MB`, `16MB`, `32MB`, `1GB`
 - Smaller chunks = more API calls, may be more likely to hit rate limits, less likely to fail when connection is unstable
 - Larger chunks = fewer API calls, potentially fewer rate limit issues, more likely to fail when connection is unstable
+
+#### File Splitting
+- **Split large files**: Files are only split if `UPLOAD_SPLIT_SIZE` is set and valid.
+- If `UPLOAD_SPLIT_SIZE` is not set, no splitting occurs (files are uploaded whole, regardless of size).
+- Files larger than the split size will be divided into chunks (e.g., `100MB`, `1GB`).
+- Each chunk is uploaded as a separate file with `.part001`, `.part002`, etc. naming.
+- Useful for very large files or to avoid rate limits by uploading smaller pieces.
+- Chunk files are automatically cleaned up after successful upload.
+
+### Rate Limiting
+If you encounter HTTP 429 (Too Many Requests) errors:
+- Try using bigger chunk sizes (e.g., `100MB` or `1GB`)
+- Try using file splitting
+- Consider running backups during off-peak hours
+- Monitor your Google Drive API quota usage
 
 ## Docker Compose Example
 
@@ -67,6 +85,7 @@ services:
       - GDRIVE_IMPERSONATE_SUBJECT=user@yourdomain.com
       - RETENTION_DAYS=60
       - UPLOAD_CHUNK_SIZE=1GB # 1GB chunks (optional)
+      - UPLOAD_SPLIT_SIZE=100MB # Split files larger than 100MB (optional)
 ```
 
 ## Usage
