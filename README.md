@@ -13,6 +13,9 @@ A Docker container that compresses folders from `/backup/` and uploads them to G
 - Configurable retention policy to delete old backups
 - Timezone support via TZ environment variable
 - RFC3339 timestamp format with optional filename-safe mode
+- Configurable chunk size for resumable uploads
+- **Minimal Docker image** (~10MB) built with multi-stage build
+- **Go implementation** for better performance and smaller footprint
 
 ## Environment Variables
 
@@ -24,6 +27,7 @@ A Docker container that compresses folders from `/backup/` and uploads them to G
 | `RETENTION_DAYS` | Number of days to keep backups (0 = delete all) | `30` |
 | `TZ` | Timezone for timestamps (e.g., `America/New_York`) | (system default) |
 | `FILENAME_SAFE_TIMESTAMP` | Set to `true` to replace colons with dashes in timestamps | `false` |
+| `UPLOAD_CHUNK_SIZE` | Chunk size for resumable uploads (e.g., `1GB`, `8MB`, `16MB`) | (Google API default) |
 | `DEBUG` | Set to any value to enable debug logging | (disabled) |
 
 ## Timestamp Format
@@ -34,7 +38,19 @@ The script uses RFC3339 format for timestamps by default:
 
 The filename-safe format replaces colons with dashes to ensure compatibility with all filesystems, including Windows.
 
+## Upload Options
 
+### Upload Behavior
+The script uses Google Drive's Media API which automatically handles resumable uploads for all files. The chunk size configuration allows you to customize how the upload is performed.
+
+### Chunk Size Configuration
+- **Default behavior**: Uses Google Drive API's default chunk size (16MB)
+- **Custom chunk size**: Set `UPLOAD_CHUNK_SIZE` to override the default
+- Supports human-readable formats: `8MB`, `16MB`, `1GB`, `2GB`, etc.
+- Supported units: B, KB, MB, GB, TB (case-insensitive)
+- Common chunk sizes: `8MB`, `16MB`, `32MB`, `1GB`
+- Smaller chunks = more API calls, may be more likely to hit rate limits, less likely to fail when connection is unstable
+- Larger chunks = fewer API calls, potentially fewer rate limit issues, more likely to fail when connection is unstable
 
 ## Docker Compose Example
 
@@ -47,13 +63,10 @@ services:
       - ./backup:/backup
       - ./credentials.json:/creds/credentials.json
     environment:
-      - GOOGLE_CREDENTIALS=/creds/credentials.json # default
       - GDRIVE_FOLDER_ID=your-folder-id
       - GDRIVE_IMPERSONATE_SUBJECT=user@yourdomain.com
-      - RETENTION_DAYS=30 # default
-      - TZ=America/New_York # default to host
-      - FILENAME_SAFE_TIMESTAMP=false #default
-      - DEBUG=false # default
+      - RETENTION_DAYS=60
+      - UPLOAD_CHUNK_SIZE=1GB # 1GB chunks (optional)
 ```
 
 ## Usage

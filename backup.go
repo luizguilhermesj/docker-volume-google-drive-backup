@@ -10,14 +10,33 @@ import (
 	"log"
 	"os"
 	"path/filepath"
+	"regexp"
 	"strconv"
 	"strings"
 	"time"
 
 	"golang.org/x/oauth2/google"
 	"google.golang.org/api/drive/v3"
+	"google.golang.org/api/googleapi"
 	"google.golang.org/api/option"
 )
+
+// Debug logger that only logs when DEBUG environment variable is set
+type debugLogger struct {
+	enabled bool
+}
+
+func newDebugLogger() *debugLogger {
+	return &debugLogger{
+		enabled: os.Getenv("DEBUG") != "",
+	}
+}
+
+func (d *debugLogger) Printf(format string, v ...interface{}) {
+	if d.enabled {
+		log.Printf("[DEBUG] "+format, v...)
+	}
+}
 
 const (
 	backupDir      = "/backup"
@@ -73,11 +92,13 @@ func compressFolder(src, dest string) error {
 
 func uploadToDrive(srv *drive.Service, filePath, fileName, parentID string) (string, error) {
 	log.Printf("[UPLOAD] Starting upload for %s", fileName)
+	
 	f, err := os.Open(filePath)
 	if err != nil {
-		return "", err
+		return "", fmt.Errorf("failed to open file: %w", err)
 	}
 	defer f.Close()
+
 	file := &drive.File{Name: fileName}
 	if parentID != "" {
 		file.Parents = []string{parentID}
@@ -85,27 +106,49 @@ func uploadToDrive(srv *drive.Service, filePath, fileName, parentID string) (str
 		file.Parents = []string{"root"}
 	}
 	
+	// Create the upload call
 	createCall := srv.Files.Create(file).
 		SupportsAllDrives(true).
-		Media(f).
 		Fields("id")
+
+	// Check if custom chunk size is specified
+	var chunkSize int64 = 0
+	if chunkSizeStr := os.Getenv("UPLOAD_CHUNK_SIZE"); chunkSizeStr != "" {
+		var err error
+		chunkSize, err = parseSizeString(chunkSizeStr)
+		if err != nil {
+			log.Printf("[WARN] Invalid UPLOAD_CHUNK_SIZE value: %s (%v), using default", chunkSizeStr, err)
+		} else {
+			log.Printf("[UPLOAD] Setting chunk size to %d bytes (%s)", chunkSize, chunkSizeStr)
+		}
+	}
+	
+	// Use custom chunk size if specified, otherwise use default
+	if chunkSize > 0 {
+		log.Printf("[UPLOAD] Using custom chunk size of %d bytes", chunkSize)
+		createCall = createCall.Media(f, googleapi.ChunkSize(int(chunkSize)))
+	} else {
+		log.Printf("[UPLOAD] Using default chunk size")
+		createCall = createCall.Media(f)
+	}
 	
 	created, err := createCall.Do()
 	if err != nil {
-		return "", err
+		return "", fmt.Errorf("failed to upload: %w", err)
 	}
+	
 	log.Printf("[UPLOAD] Finished upload for %s. File ID: %s", fileName, created.Id)
 	return created.Id, nil
 }
 
 func cleanupOldBackups(srv *drive.Service, parentID string, retentionDays int) error {
+	debug := newDebugLogger()
 	cutoff := time.Now().AddDate(0, 0, -retentionDays)
 	log.Printf("[RETENTION] Checking for backups older than %d days (cutoff: %s)", retentionDays, cutoff.Format(time.RFC3339))
-	debug := os.Getenv("DEBUG") != ""
+	
 	q := "name contains '.tar.gz' and trashed = false"
-	if debug {
-		log.Printf("[DEBUG] Retention query: %s", q)
-	}
+	debug.Printf("Retention query: %s", q)
+	
 	filesList := srv.Files.List().Q(q).SupportsAllDrives(true).Fields("files(id, name, createdTime, parents)")
 	if parentID != "" && parentID != "root" {
 		filesList = filesList.DriveId(parentID).Corpora("drive").IncludeItemsFromAllDrives(true)
@@ -114,13 +157,10 @@ func cleanupOldBackups(srv *drive.Service, parentID string, retentionDays int) e
 	if err != nil {
 		return fmt.Errorf("listing files: %w", err)
 	}
-	if debug {
-		log.Printf("[DEBUG] Found %d files for retention check", len(files.Files))
-	}
+	debug.Printf("Found %d files for retention check", len(files.Files))
+	
 	for _, f := range files.Files {
-		if debug {
-			log.Printf("[DEBUG] Checking file: %s (created %s) parents: %v", f.Name, f.CreatedTime, f.Parents)
-		}
+		debug.Printf("Checking file: %s (created %s) parents: %v", f.Name, f.CreatedTime, f.Parents)
 		created, err := time.Parse(time.RFC3339, f.CreatedTime)
 		if err != nil {
 			log.Printf("[RETENTION] Could not parse time for file %s: %v", f.Name, err)
@@ -160,6 +200,51 @@ func formatTimestampForFilename(t time.Time) string {
 	}
 	
 	return timestamp
+}
+
+func parseSizeString(sizeStr string) (int64, error) {
+	// Remove any whitespace and convert to lowercase
+	sizeStr = strings.TrimSpace(strings.ToLower(sizeStr))
+	
+	// Regex to match patterns like "10mb", "1.5gb", "1024kb", etc.
+	re := regexp.MustCompile(`^(\d+(?:\.\d+)?)\s*(b|kb|mb|gb|tb)$`)
+	matches := re.FindStringSubmatch(sizeStr)
+	
+	if len(matches) != 3 {
+		return 0, fmt.Errorf("invalid size format: %s (expected format like '10MB', '1.5GB', etc.)", sizeStr)
+	}
+	
+	// Parse the numeric value
+	value, err := strconv.ParseFloat(matches[1], 64)
+	if err != nil {
+		return 0, fmt.Errorf("invalid numeric value: %s", matches[1])
+	}
+	
+	// Convert to bytes based on unit
+	unit := matches[2]
+	var multiplier float64
+	
+	switch unit {
+	case "b":
+		multiplier = 1
+	case "kb":
+		multiplier = 1024
+	case "mb":
+		multiplier = 1024 * 1024
+	case "gb":
+		multiplier = 1024 * 1024 * 1024
+	case "tb":
+		multiplier = 1024 * 1024 * 1024 * 1024
+	default:
+		return 0, fmt.Errorf("unknown unit: %s", unit)
+	}
+	
+	result := int64(value * multiplier)
+	if result <= 0 {
+		return 0, fmt.Errorf("size must be greater than 0")
+	}
+	
+	return result, nil
 }
 
 
